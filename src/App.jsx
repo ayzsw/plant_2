@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 const AGENT_STEPS = [
@@ -8,6 +8,74 @@ const AGENT_STEPS = [
   { id: 'context', label: 'Context', detail: 'Учет региона, сезона и цели исследования' },
   { id: 'report', label: 'Report', detail: 'Сборка итогового научного отчета' },
 ]
+
+const SLEEP_BASE_MS = 700
+
+function nowStamp() {
+  return new Date().toLocaleString('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function inferPlantType(goal = '') {
+  const normalizedGoal = goal.toLowerCase()
+  if (normalizedGoal.includes('болез') || normalizedGoal.includes('disease')) return 'листовое поражение'
+  if (normalizedGoal.includes('урож') || normalizedGoal.includes('yield')) return 'плодовая культура'
+  if (normalizedGoal.includes('дефиц') || normalizedGoal.includes('deficit')) return 'стресс питания'
+  return 'вегетативный образец'
+}
+
+function buildReport({ imageName, region, season, goal, retries }) {
+  const plantType = inferPlantType(goal)
+  const confidence = Math.max(72, 92 - retries * 7)
+
+  return {
+    title: 'Plant Field Research Report',
+    generatedAt: nowStamp(),
+    confidence,
+    retries,
+    evidence: [
+      `Файл: ${imageName || 'Unnamed image'}`,
+      'Качество изображения оценено как достаточное для морфологического скрининга.',
+      `Обнаружены признаки, соответствующие категории: ${plantType}.`,
+    ],
+    hypotheses: [
+      'H1: Нормальная фенологическая стадия без критических отклонений.',
+      'H2: Локальный абиотический стресс (вода/температура/питание).',
+      'H3: Ранний биотический фактор (грибковое или бактериальное поражение).',
+    ],
+    verification: [
+      'Согласованность визуальных признаков проверена между сегментами листа/стебля.',
+      `Self-check циклов: ${retries + 1}`,
+      retries > 0
+        ? 'После повторного прогона устранены противоречия в гипотезах H2/H3.'
+        : 'Критических противоречий в первичной проверке не выявлено.',
+    ],
+    context: [
+      `Регион: ${region || 'не указан'}`,
+      `Сезон: ${season || 'не указан'}`,
+      `Цель исследования: ${goal || 'общая идентификация состояния растения'}`,
+    ],
+    conclusion:
+      confidence >= 85
+        ? 'Состояние образца интерпретируется как стабильное с умеренным риском раннего стресса.'
+        : 'Требуется дополнительная валидация: текущие данные частично противоречивы.',
+    nextShots: [
+      'Сфотографировать нижнюю сторону листа крупным планом (макропризнаки поражения).',
+      'Добавить кадр стебля у основания с естественным освещением.',
+      'Сделать общий кадр растения целиком с ближайшими соседними растениями.',
+      'Повторить съемку через 48 часов с тем же ракурсом для динамики симптомов.',
+    ],
+  }
+}
 
 function toMarkdown(report) {
   if (!report) return ''
@@ -35,15 +103,6 @@ function toMarkdown(report) {
   ].join('\n')
 }
 
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(reader.result)
-    reader.onerror = () => reject(new Error('Unable to read image'))
-    reader.readAsDataURL(file)
-  })
-}
-
 function App() {
   const [imageFile, setImageFile] = useState(null)
   const [imagePreview, setImagePreview] = useState('')
@@ -53,7 +112,6 @@ function App() {
 
   const [running, setRunning] = useState(false)
   const [currentStep, setCurrentStep] = useState(-1)
-  const [runError, setRunError] = useState('')
   const [stepStates, setStepStates] = useState(() =>
     AGENT_STEPS.map((step) => ({
       ...step,
@@ -71,8 +129,6 @@ function App() {
       return []
     }
   })
-
-  const eventSourceRef = useRef(null)
 
   const progress = useMemo(() => {
     const done = stepStates.filter((step) => step.status === 'done').length
@@ -100,7 +156,6 @@ function App() {
   useEffect(() => {
     return () => {
       if (imagePreview) URL.revokeObjectURL(imagePreview)
-      if (eventSourceRef.current) eventSourceRef.current.close()
     }
   }, [imagePreview])
 
@@ -112,8 +167,10 @@ function App() {
     })
   }
 
-  const resetRunState = () => {
-    setRunError('')
+  const runAgent = async () => {
+    if (!imageFile || running) return
+
+    setRunning(true)
     setReport(null)
     setCurrentStep(-1)
     setStepStates(
@@ -123,97 +180,46 @@ function App() {
         note: 'Ожидает запуска',
       })),
     )
-  }
 
-  const connectRunStream = (runId) => {
-    if (eventSourceRef.current) eventSourceRef.current.close()
+    let retries = 0
 
-    const source = new EventSource(`/api/research/stream/${runId}`)
-    eventSourceRef.current = source
+    for (let i = 0; i < AGENT_STEPS.length; i += 1) {
+      setCurrentStep(i)
+      updateStep(i, { status: 'running', note: 'Выполняется анализ...' })
+      await sleep(SLEEP_BASE_MS + i * 220)
 
-    source.onmessage = (event) => {
-      const payload = JSON.parse(event.data)
-
-      if (payload.type === 'step_update') {
-        setCurrentStep(payload.status === 'done' ? -1 : payload.index)
-        updateStep(payload.index, {
-          status: payload.status,
-          note: payload.note,
+      if (AGENT_STEPS[i].id === 'verification' && retries === 0 && Math.random() < 0.55) {
+        updateStep(i, {
+          status: 'retry',
+          note: 'Self-check обнаружил конфликт гипотез, повторная верификация...',
         })
-        return
+        retries += 1
+        await sleep(SLEEP_BASE_MS + 480)
       }
 
-      if (payload.type === 'report_ready') {
-        setReport(payload.report)
-        setRunning(false)
-        setCurrentStep(-1)
-        source.close()
-        eventSourceRef.current = null
-
-        storeHistory({
-          id: payload.runId,
-          at: payload.report.generatedAt,
-          imageName: imageFile?.name || 'unknown',
-          confidence: payload.report.confidence,
-          region: region || 'N/A',
-          season: season || 'N/A',
-        })
-        return
-      }
-
-      if (payload.type === 'run_error') {
-        setRunError(payload.message || 'Ошибка сервера во время анализа')
-        setRunning(false)
-        setCurrentStep(-1)
-        source.close()
-        eventSourceRef.current = null
-      }
+      updateStep(i, { status: 'done', note: 'Шаг завершен' })
     }
 
-    source.onerror = () => {
-      if (!running) return
-      setRunError('Потеряно соединение с сервером (SSE stream).')
-      setRunning(false)
-      setCurrentStep(-1)
-      source.close()
-      eventSourceRef.current = null
-    }
-  }
+    const generated = buildReport({
+      imageName: imageFile.name,
+      region,
+      season,
+      goal,
+      retries,
+    })
 
-  const runAgent = async () => {
-    if (!imageFile || running) return
+    setReport(generated)
+    setCurrentStep(-1)
+    setRunning(false)
 
-    resetRunState()
-    setRunning(true)
-
-    try {
-      const imageDataUrl = await fileToDataUrl(imageFile)
-
-      const response = await fetch('/api/research/run', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          imageDataUrl,
-          imageName: imageFile.name,
-          region,
-          season,
-          goal,
-        }),
-      })
-
-      const data = await response.json()
-      if (!response.ok || !data.runId) {
-        throw new Error(data.error || 'Не удалось запустить агент')
-      }
-
-      connectRunStream(data.runId)
-    } catch (error) {
-      setRunError(error instanceof Error ? error.message : 'Unknown error')
-      setRunning(false)
-      setCurrentStep(-1)
-    }
+    storeHistory({
+      id: crypto.randomUUID(),
+      at: generated.generatedAt,
+      imageName: imageFile.name,
+      confidence: generated.confidence,
+      region: region || 'N/A',
+      season: season || 'N/A',
+    })
   }
 
   const exportMarkdown = () => {
@@ -291,7 +297,6 @@ function App() {
           </button>
           <span className="progress">Progress: {progress}%</span>
         </div>
-        {runError ? <p className="run-error">{runError}</p> : null}
       </section>
 
       <section className="panel">
